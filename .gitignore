@@ -1,0 +1,19 @@
+# Segredos — NUNCA versionar
+.env
+.env.*
+!.env.example
+
+# Ambiente virtual Python
+venv/
+.venv/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
