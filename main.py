@@ -2,7 +2,7 @@ import os
 import re
 import uuid
 import requests
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -12,9 +12,17 @@ load_dotenv()
 
 app = FastAPI(title="Teical API", description="Backend de IA para Leilões")
 
+# Apenas o site oficial e o ambiente de desenvolvimento podem chamar a API pelo navegador
+ORIGENS_PERMITIDAS = [
+    "https://teical.com.br",
+    "https://www.teical.com.br",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ORIGENS_PERMITIDAS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,6 +33,33 @@ key_supabase: str = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(url_supabase, key_supabase)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+# Limites de upload — protegem contra abuso e estouro da cota gratuita
+TAMANHO_MAX_PDF = 10 * 1024 * 1024    # 10 MB
+TAMANHO_MAX_FOTO = 5 * 1024 * 1024    # 5 MB por foto
+MAX_FOTOS = 10
+CARGOS_AUTORIZADOS = {"leiloeiro", "admin"}
+
+
+def validar_leiloeiro(authorization: str | None):
+    """Valida o token de sessão do Supabase e exige cargo de leiloeiro ou admin."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Autenticação necessária.")
+    token = authorization.removeprefix("Bearer ").strip()
+
+    try:
+        usuario = supabase.auth.get_user(token).user
+    except Exception:
+        usuario = None
+    if usuario is None:
+        raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
+
+    # app_metadata é o local seguro (só o admin altera); user_metadata é aceito
+    # temporariamente por compatibilidade, mas pode ser editado pelo próprio usuário
+    cargo = (usuario.app_metadata or {}).get("role") or (usuario.user_metadata or {}).get("role")
+    if cargo not in CARGOS_AUTORIZADOS:
+        raise HTTPException(status_code=403, detail="Acesso restrito a leiloeiros e administradores.")
+    return usuario
 
 @app.get("/")
 def home():
@@ -42,19 +77,29 @@ async def cadastrar_leilao(
     area_manual: str = Form(""),         # Campo opcional de correção humana
     categoria_manual: str = Form(""),    # Campo opcional de correção humana
     edital: UploadFile = File(...),
-    fotos: list[UploadFile] = File(...) 
+    fotos: list[UploadFile] = File(...),
+    authorization: str | None = Header(None)
 ):
+    validar_leiloeiro(authorization)
+
     if not edital.filename.endswith('.pdf'):
-        return {"erro": "O documento precisa de ser um ficheiro PDF."}
-    
+        raise HTTPException(status_code=400, detail="O documento precisa de ser um ficheiro PDF.")
+
     conteudo = await edital.read()
+    if len(conteudo) > TAMANHO_MAX_PDF:
+        raise HTTPException(status_code=413, detail="O edital excede o limite de 10 MB.")
+
+    if len(fotos) > MAX_FOTOS:
+        raise HTTPException(status_code=413, detail=f"Envie no máximo {MAX_FOTOS} fotos.")
+
     try:
         pdf_doc = fitz.open(stream=conteudo, filetype="pdf")
         texto_edital = ""
         for pagina in pdf_doc:
             texto_edital += pagina.get_text()
     except Exception as e:
-        return {"erro": f"Falha ao extrair texto do PDF: {str(e)}"}
+        print(f"Falha ao extrair texto do PDF: {e}")
+        raise HTTPException(status_code=400, detail="Não foi possível ler o PDF enviado. Verifique se o arquivo não está corrompido.")
 
     try:
         resposta_db = supabase.table("properties").select("title, location, price, status, score").limit(5).execute()
@@ -64,8 +109,9 @@ async def cadastrar_leilao(
     except Exception:
         contexto_base = "Não há imóveis cadastrados na base no momento para comparar."
 
-    url_google = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
+    # A chave vai no header (e não na URL) para nao aparecer em logs de servidor
+    url_google = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     
     # PROMPT MESTRE: FOCO POSITIVO, REALISTA E ESTRUTURADO COM TAGS DE EXTRAÇÃO
     prompt_mestre = f"""
@@ -106,18 +152,30 @@ async def cadastrar_leilao(
     
     payload = {"contents": [{"parts": [{"text": prompt_mestre}]}]}
 
-    resposta_google = requests.post(url_google, headers=headers, json=payload)
-    dados_ia = resposta_google.json()
+    try:
+        resposta_google = requests.post(url_google, headers=headers, json=payload, timeout=90)
+        dados_ia = resposta_google.json()
+    except requests.RequestException as e:
+        print(f"Falha de comunicação com o Gemini: {e}")
+        raise HTTPException(status_code=502, detail="O serviço de análise está indisponível no momento. Tente novamente.")
 
     if resposta_google.status_code != 200:
-        return {"status": "erro_google", "codigo_http": resposta_google.status_code, "motivo_real": dados_ia}
+        # Loga o motivo real no servidor, mas nao expoe detalhes internos na resposta
+        print(f"Erro do Gemini (HTTP {resposta_google.status_code}): {dados_ia}")
+        raise HTTPException(status_code=502, detail="A análise de IA falhou. Tente novamente em alguns minutos.")
 
     # Upload e processamento da galeria de fotos
     urls_fotos = []
     erros_upload = []
     if fotos and fotos[0].filename != "":
         for foto in fotos:
+            if not (foto.content_type or "").startswith("image/"):
+                erros_upload.append(f"'{foto.filename}' ignorada: não é uma imagem.")
+                continue
             conteudo_foto = await foto.read()
+            if len(conteudo_foto) > TAMANHO_MAX_FOTO:
+                erros_upload.append(f"'{foto.filename}' ignorada: excede o limite de 5 MB.")
+                continue
             nome_unico = f"{uuid.uuid4()}_{foto.filename.replace(' ', '_')}"
             
             try:
