@@ -37,6 +37,18 @@ A API sobe em `http://127.0.0.1:8000`. A documentação interativa fica em `http
 | `SUPABASE_KEY` | Chave de API do Supabase |
 | `GEMINI_API_KEY` | Chave da API do Google Gemini |
 
+## Deploy (Render)
+
+O repositório tem um `render.yaml` (Blueprint). Para publicar:
+
+1. Crie uma conta em [render.com](https://render.com) entrando com o GitHub
+2. **New → Blueprint** → selecione o repositório `Teical/teical-api`
+3. Preencha as três variáveis de ambiente quando solicitado (mesmos valores do `.env`)
+4. A cada `git push` na branch `main`, o Render faz o redeploy automaticamente
+
+> No plano gratuito o servidor "dorme" após 15 min sem uso; a primeira
+> requisição depois disso demora ~1 min para acordar.
+
 ## Endpoints
 
 | Método | Rota | Descrição |
