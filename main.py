@@ -113,6 +113,17 @@ def exigir_dono_ou_admin(usuario, imovel: dict):
     raise HTTPException(status_code=403, detail="Você só pode gerenciar os imóveis que você cadastrou.")
 
 
+def garantir_bucket(nome: str):
+    """Cria o bucket público se ele ainda não existir (evita falha no primeiro upload)."""
+    try:
+        existentes = [getattr(b, "name", None) or (b.get("name") if isinstance(b, dict) else None)
+                      for b in supabase.storage.list_buckets()]
+        if nome not in existentes:
+            supabase.storage.create_bucket(nome, options={"public": True})
+    except Exception as e:
+        print(f"Não foi possível garantir o bucket '{nome}': {e}")
+
+
 def extrair_texto_pdf(conteudo: bytes) -> str:
     try:
         pdf_doc = fitz.open(stream=conteudo, filetype="pdf")
@@ -429,6 +440,7 @@ async def criar_noticia(
         conteudo_img = await imagem.read()
         if len(conteudo_img) > TAMANHO_MAX_FOTO:
             raise HTTPException(status_code=413, detail="A imagem de capa excede o limite de 5 MB.")
+        garantir_bucket("noticias")
         nome_unico = f"{uuid.uuid4()}_{imagem.filename.replace(' ', '_')}"
         try:
             supabase.storage.from_("noticias").upload(
