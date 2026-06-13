@@ -37,6 +37,30 @@ A API sobe em `http://127.0.0.1:8000`. A documentação interativa fica em `http
 | `SUPABASE_KEY` | Chave de API do Supabase |
 | `GEMINI_API_KEY` | Chave da API do Google Gemini |
 
+## Gestão de leiloeiros e admins
+
+Todo usuário é um comprador por padrão. Cargos são definidos no `app_metadata`
+(que só o dono do projeto Supabase altera) via SQL Editor:
+
+```sql
+-- Promover a leiloeiro (para admin, troque o valor de role)
+update auth.users
+set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role": "leiloeiro"}'::jsonb
+where email = 'pessoa@exemplo.com';
+
+-- Listar quem tem cargo
+select email, raw_app_meta_data->>'role' as cargo from auth.users
+where raw_app_meta_data->>'role' is not null;
+
+-- Remover o cargo (volta a ser comprador)
+update auth.users
+set raw_app_meta_data = raw_app_meta_data - 'role'
+where email = 'pessoa@exemplo.com';
+```
+
+A pessoa precisa sair e entrar de novo no site para o cargo novo valer.
+Banir/excluir contas: painel Authentication → Users → menu da conta.
+
 ## Deploy (Render)
 
 O repositório tem um `render.yaml` (Blueprint). Para publicar:
