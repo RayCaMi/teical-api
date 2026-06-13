@@ -42,6 +42,7 @@ TAMANHO_MAX_FOTO = 5 * 1024 * 1024    # 5 MB por foto
 MAX_FOTOS = 10
 CARGOS_AUTORIZADOS = {"leiloeiro", "admin"}
 CATEGORIAS = ["Casa", "Apartamento", "Galpão", "Lajes", "Outros"]
+CATEGORIAS_NOTICIA = ["Leilões", "Direito Imobiliário", "Mercado", "Jurisprudência", "Tributário", "Tecnologia"]
 
 
 class AtualizacaoImovel(BaseModel):
@@ -57,6 +58,19 @@ class AtualizacaoImovel(BaseModel):
     categoria: str | None = None
     status: str | None = None
     analise_manual: str | None = None
+
+
+class AtualizacaoNoticia(BaseModel):
+    """Campos editáveis de uma notícia (todos opcionais)."""
+    titulo: str | None = None
+    resumo: str | None = None
+    conteudo: str | None = None
+    categoria: str | None = None
+    autor: str | None = None
+    imagem_url: str | None = None
+    leitura_minutos: int | None = None
+    is_novo: bool | None = None
+    is_tendencia: bool | None = None
 
 
 def cargo_do_usuario(usuario) -> str:
@@ -381,3 +395,106 @@ def remover_imovel(imovel_id: str, authorization: str | None = Header(None)):
 
     supabase.table("properties").delete().eq("id", imovel_id).execute()
     return {"status": "removido", "imovel_id": imovel_id}
+
+
+# ----------------------------------------------------------------------------
+# NOTÍCIAS — conteúdo editorial gerenciado por leiloeiros e admins.
+# Leitura é pública (feita direto no Supabase pelo front); escrita exige staff.
+# ----------------------------------------------------------------------------
+
+@app.post("/noticias/")
+async def criar_noticia(
+    titulo: str = Form(...),
+    resumo: str = Form(...),
+    conteudo: str = Form(...),
+    categoria: str = Form(...),
+    autor: str = Form(...),
+    leitura_minutos: int = Form(3),
+    is_novo: bool = Form(False),
+    is_tendencia: bool = Form(False),
+    imagem_url: str = Form(""),
+    imagem: UploadFile | None = File(None),
+    authorization: str | None = Header(None)
+):
+    validar_leiloeiro(authorization)
+
+    if categoria not in CATEGORIAS_NOTICIA:
+        raise HTTPException(status_code=400, detail=f"Categoria inválida. Opções: {', '.join(CATEGORIAS_NOTICIA)}.")
+
+    url_capa = imagem_url.strip()
+    # Se enviaram um arquivo, ele tem prioridade sobre a URL colada
+    if imagem and imagem.filename:
+        if not (imagem.content_type or "").startswith("image/"):
+            raise HTTPException(status_code=400, detail="A capa precisa ser uma imagem.")
+        conteudo_img = await imagem.read()
+        if len(conteudo_img) > TAMANHO_MAX_FOTO:
+            raise HTTPException(status_code=413, detail="A imagem de capa excede o limite de 5 MB.")
+        nome_unico = f"{uuid.uuid4()}_{imagem.filename.replace(' ', '_')}"
+        try:
+            supabase.storage.from_("noticias").upload(
+                path=nome_unico,
+                file=conteudo_img,
+                file_options={"content-type": imagem.content_type}
+            )
+            url_capa = supabase.storage.from_("noticias").get_public_url(nome_unico)
+        except Exception as e:
+            print(f"Falha ao subir imagem da notícia: {e}")
+            raise HTTPException(status_code=502, detail="Não foi possível salvar a imagem de capa.")
+
+    if not url_capa:
+        raise HTTPException(status_code=400, detail="Informe uma imagem de capa (arquivo ou URL).")
+
+    nova = {
+        "titulo": titulo,
+        "resumo": resumo,
+        "conteudo": conteudo,
+        "categoria": categoria,
+        "autor": autor,
+        "imagem_url": url_capa,
+        "leitura_minutos": leitura_minutos,
+        "is_novo": is_novo,
+        "is_tendencia": is_tendencia,
+    }
+    try:
+        inserida = supabase.table("news").insert(nova).execute().data[0]
+    except Exception as e:
+        print(f"Erro ao guardar notícia: {e}")
+        raise HTTPException(status_code=500, detail="Não foi possível salvar a notícia.")
+    return {"status": "criada", "noticia_id": inserida["id"]}
+
+
+@app.patch("/noticias/{noticia_id}")
+def atualizar_noticia(noticia_id: str, mudancas: AtualizacaoNoticia, authorization: str | None = Header(None)):
+    validar_leiloeiro(authorization)
+    existe = supabase.table("news").select("id").eq("id", noticia_id).execute()
+    if not existe.data:
+        raise HTTPException(status_code=404, detail="Notícia não encontrada.")
+
+    dados = mudancas.model_dump(exclude_none=True)
+    if not dados:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    if "categoria" in dados and dados["categoria"] not in CATEGORIAS_NOTICIA:
+        raise HTTPException(status_code=400, detail=f"Categoria inválida. Opções: {', '.join(CATEGORIAS_NOTICIA)}.")
+
+    supabase.table("news").update(dados).eq("id", noticia_id).execute()
+    return {"status": "atualizada", "campos": list(dados.keys())}
+
+
+@app.delete("/noticias/{noticia_id}")
+def remover_noticia(noticia_id: str, authorization: str | None = Header(None)):
+    validar_leiloeiro(authorization)
+    noticia = supabase.table("news").select("imagem_url").eq("id", noticia_id).execute()
+    if not noticia.data:
+        raise HTTPException(status_code=404, detail="Notícia não encontrada.")
+
+    # Remove a capa do storage se ela foi hospedada por nós (melhor esforço)
+    url = noticia.data[0].get("imagem_url") or ""
+    if "/noticias/" in url:
+        nome = url.split("/noticias/")[-1].split("?")[0]
+        try:
+            supabase.storage.from_("noticias").remove([nome])
+        except Exception as e:
+            print(f"Falha ao remover capa da notícia: {e}")
+
+    supabase.table("news").delete().eq("id", noticia_id).execute()
+    return {"status": "removida", "noticia_id": noticia_id}
