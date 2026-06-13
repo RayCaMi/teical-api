@@ -4,6 +4,7 @@ import uuid
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import fitz
@@ -43,6 +44,27 @@ CARGOS_AUTORIZADOS = {"leiloeiro", "admin"}
 CATEGORIAS = ["Casa", "Apartamento", "Galpão", "Lajes", "Outros"]
 
 
+class AtualizacaoImovel(BaseModel):
+    """Campos que podem ser editados depois do cadastro (todos opcionais)."""
+    title: str | None = None
+    location: str | None = None
+    endereco: str | None = None
+    price: float | None = None
+    link_leiloeiro: str | None = None
+    quartos: int | None = None
+    vagas: int | None = None
+    area: float | None = None
+    categoria: str | None = None
+    status: str | None = None
+    analise_manual: str | None = None
+
+
+def cargo_do_usuario(usuario) -> str:
+    # app_metadata é o local seguro (só o admin altera); user_metadata é aceito
+    # temporariamente por compatibilidade, mas pode ser editado pelo próprio usuário
+    return (usuario.app_metadata or {}).get("role") or (usuario.user_metadata or {}).get("role") or ""
+
+
 def validar_leiloeiro(authorization: str | None):
     """Valida o token de sessão do Supabase e exige cargo de leiloeiro ou admin."""
     if not authorization or not authorization.startswith("Bearer "):
@@ -56,12 +78,25 @@ def validar_leiloeiro(authorization: str | None):
     if usuario is None:
         raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
 
-    # app_metadata é o local seguro (só o admin altera); user_metadata é aceito
-    # temporariamente por compatibilidade, mas pode ser editado pelo próprio usuário
-    cargo = (usuario.app_metadata or {}).get("role") or (usuario.user_metadata or {}).get("role")
-    if cargo not in CARGOS_AUTORIZADOS:
+    if cargo_do_usuario(usuario) not in CARGOS_AUTORIZADOS:
         raise HTTPException(status_code=403, detail="Acesso restrito a leiloeiros e administradores.")
     return usuario
+
+
+def obter_imovel(imovel_id: str) -> dict:
+    resposta = supabase.table("properties").select("*").eq("id", imovel_id).execute()
+    if not resposta.data:
+        raise HTTPException(status_code=404, detail="Imóvel não encontrado.")
+    return resposta.data[0]
+
+
+def exigir_dono_ou_admin(usuario, imovel: dict):
+    """Admins gerenciam qualquer imóvel; leiloeiros, apenas os que cadastraram."""
+    if cargo_do_usuario(usuario) == "admin":
+        return
+    if imovel.get("owner_id") == usuario.id:
+        return
+    raise HTTPException(status_code=403, detail="Você só pode gerenciar os imóveis que você cadastrou.")
 
 
 def extrair_texto_pdf(conteudo: bytes) -> str:
@@ -173,7 +208,7 @@ def upload_fotos(fotos: list[UploadFile], conteudos: list[bytes]) -> tuple[list[
 
 @app.get("/")
 def home():
-    resposta = supabase.table("properties").select("*").order("score", desc=True).execute()
+    resposta = supabase.table("properties").select("*").neq("status", "Pendente").order("score", desc=True).execute()
     return {"status": "online", "imoveis_no_banco": resposta.data}
 
 
@@ -181,6 +216,7 @@ def home():
 async def cadastrar_leilao(
     titulo: str = Form(...),
     localizacao: str = Form(...),
+    endereco: str = Form(""),
     preco: float = Form(...),
     link_leiloeiro: str = Form(...),
     quartos_manual: str = Form(""),      # Campos opcionais de correção humana:
@@ -192,7 +228,7 @@ async def cadastrar_leilao(
     fotos: list[UploadFile] = File(...),
     authorization: str | None = Header(None)
 ):
-    validar_leiloeiro(authorization)
+    usuario = validar_leiloeiro(authorization)
 
     if not edital.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="O documento precisa de ser um ficheiro PDF.")
@@ -245,12 +281,15 @@ async def cadastrar_leilao(
     a_final = float(area_manual) if area_manual.replace('.', '', 1).isdigit() else float(analise.get("area", 0.0))
     c_final = categoria_manual if categoria_manual in CATEGORIAS else analise.get("categoria", "Outros")
 
+    # O imóvel entra como "Pendente": só aparece no site depois que quem
+    # enviou revisar a análise da IA e confirmar a publicação
     novo_imovel = {
         "title": titulo,
         "location": localizacao,
+        "endereco": endereco.strip(),
         "price": preco,
         "score": score_numerico,
-        "status": "Em Leilão",
+        "status": "Pendente",
         "image_url": foto_capa,
         "galeria": urls_fotos,
         "memorial_analise": analise.get("parecer", ""),
@@ -258,29 +297,22 @@ async def cadastrar_leilao(
         "quartos": q_final,
         "vagas": v_final,
         "area": a_final,
-        "categoria": c_final
+        "categoria": c_final,
+        "owner_id": usuario.id
     }
-    # Só inclui o parecer manual se foi preenchido (a coluna analise_manual precisa existir no Supabase)
     if analise_manual.strip():
         novo_imovel["analise_manual"] = analise_manual.strip()
 
     try:
-        supabase.table("properties").insert(novo_imovel).execute()
-        mensagem_db = "Cadastro guardado com sucesso! Extração estruturada realizada com sucesso."
+        inserido = supabase.table("properties").insert(novo_imovel).execute().data[0]
     except Exception as erro_db:
         print(f"Erro ao guardar no banco: {erro_db}")
-        mensagem_db = "A análise foi concluída, mas houve um erro ao guardar no banco de dados."
+        raise HTTPException(status_code=500, detail="A análise foi concluída, mas não foi possível salvar o rascunho. Tente novamente.")
 
     return {
-        "status": "concluido",
-        "banco_de_dados": mensagem_db,
+        "status": "pendente_confirmacao",
+        "imovel_id": inserido["id"],
         "erros_upload": erros_upload,
-        "dados_recebidos": {
-            "titulo": titulo,
-            "localizacao": localizacao,
-            "preco": preco,
-            "link_leiloeiro": link_leiloeiro
-        },
         "score_extraido": score_numerico,
         "dados_finais_infraestrutura": {
             "quartos": q_final,
@@ -290,3 +322,62 @@ async def cadastrar_leilao(
         },
         "analise": analise.get("parecer", "")
     }
+
+
+@app.post("/confirmar-leilao/{imovel_id}")
+def confirmar_leilao(imovel_id: str, authorization: str | None = Header(None)):
+    """Publica um imóvel que estava aguardando a revisão da análise da IA."""
+    usuario = validar_leiloeiro(authorization)
+    imovel = obter_imovel(imovel_id)
+    exigir_dono_ou_admin(usuario, imovel)
+    supabase.table("properties").update({"status": "Em Leilão"}).eq("id", imovel_id).execute()
+    return {"status": "publicado", "imovel_id": imovel_id}
+
+
+@app.get("/meus-imoveis/")
+def meus_imoveis(authorization: str | None = Header(None)):
+    """Lista os imóveis do leiloeiro logado (admins veem todos), incluindo pendentes."""
+    usuario = validar_leiloeiro(authorization)
+    consulta = supabase.table("properties").select("*").order("score", desc=True)
+    if cargo_do_usuario(usuario) != "admin":
+        consulta = consulta.eq("owner_id", usuario.id)
+    return {"imoveis": consulta.execute().data}
+
+
+@app.patch("/imoveis/{imovel_id}")
+def atualizar_imovel(imovel_id: str, mudancas: AtualizacaoImovel, authorization: str | None = Header(None)):
+    """Edita um imóvel. Admin edita qualquer um; leiloeiro, apenas os seus."""
+    usuario = validar_leiloeiro(authorization)
+    imovel = obter_imovel(imovel_id)
+    exigir_dono_ou_admin(usuario, imovel)
+
+    dados = mudancas.model_dump(exclude_none=True)
+    if not dados:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    if "categoria" in dados and dados["categoria"] not in CATEGORIAS:
+        raise HTTPException(status_code=400, detail=f"Categoria inválida. Opções: {', '.join(CATEGORIAS)}.")
+
+    supabase.table("properties").update(dados).eq("id", imovel_id).execute()
+    return {"status": "atualizado", "campos": list(dados.keys())}
+
+
+@app.delete("/imoveis/{imovel_id}")
+def remover_imovel(imovel_id: str, authorization: str | None = Header(None)):
+    """Remove um imóvel e suas fotos. Admin remove qualquer um; leiloeiro, apenas os seus."""
+    usuario = validar_leiloeiro(authorization)
+    imovel = obter_imovel(imovel_id)
+    exigir_dono_ou_admin(usuario, imovel)
+
+    # Remove as fotos do storage (melhor esforço: falha aqui não impede a exclusão)
+    nomes = []
+    for url in (imovel.get("galeria") or []):
+        if "/imoveis/" in url:
+            nomes.append(url.split("/imoveis/")[-1].split("?")[0])
+    if nomes:
+        try:
+            supabase.storage.from_("imoveis").remove(nomes)
+        except Exception as e:
+            print(f"Falha ao remover fotos do storage: {e}")
+
+    supabase.table("properties").delete().eq("id", imovel_id).execute()
+    return {"status": "removido", "imovel_id": imovel_id}
